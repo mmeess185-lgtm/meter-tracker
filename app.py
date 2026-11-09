@@ -960,8 +960,14 @@ class Handler(BaseHTTPRequestHandler):
     def serve_logo(self, path):
         name = path[len("/logos/"):]
         stem = name[:-4] if name.endswith(".png") else ""
-        file_path = os.path.join(BASE_DIR, "logos", stem + ".png")
-        if stem not in LOGO_NAMES or not os.path.isfile(file_path):
+        file_path = ""
+        if stem in LOGO_NAMES:
+            for folder in (os.path.join(BASE_DIR, "logos"), BASE_DIR):
+                candidate = os.path.join(folder, stem + ".png")
+                if os.path.isfile(candidate):
+                    file_path = candidate
+                    break
+        if not file_path:
             self.send_bytes(404, b"", "text/plain")
             return
         with open(file_path, "rb") as f:
