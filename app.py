@@ -2,7 +2,7 @@
 
 Environment variables (set in Render):
   MONGO_URI     database link (same one the other trackers use)
-  APP_PASSWORD  the password people type to open the site
+  APP_PASSWORD  optional: if set, people must type it to open the site
   PORT          set by Render automatically
 """
 import csv
@@ -410,6 +410,7 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>وريف | العدادات</title>
+<meta name="robots" content="noindex,nofollow">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -920,6 +921,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def signed_in(self):
+        if not APP_PASSWORD:
+            return True
         raw = self.headers.get("Cookie", "")
         try:
             jar = SimpleCookie(raw)
@@ -996,10 +999,11 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/logos/"):
             self.serve_logo(path)
         elif path == "/":
-            if not APP_PASSWORD:
-                self.send_page("<p dir=rtl>لم يتم ضبط APP_PASSWORD في Render.</p>", 503)
-            elif self.signed_in():
-                self.send_page(INDEX_HTML)
+            if self.signed_in():
+                page = INDEX_HTML
+                if not APP_PASSWORD:
+                    page = page.replace('<form method="post" action="/logout"', '<form hidden method="post" action="/logout"')
+                self.send_page(page)
             else:
                 self.login_page()
         elif not path.startswith("/api/"):
