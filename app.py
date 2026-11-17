@@ -40,6 +40,7 @@ MAX_BODY = 64 * 1024
 SESSION_SECONDS = 12 * 3600
 COOKIE_NAME = "meters_session"
 TYPES = {"electricity", "water"}
+PAYERS = {"company", "tenant"}  # who pays the bills: the company, or the tenant on his own meter
 RIYADH = timezone(timedelta(hours=3))
 
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000) if MONGO_URI else None
@@ -192,6 +193,8 @@ def meter_fields(body):
         "building": clean(body.get("building"), 120),
         "unit": clean(body.get("unit"), 60),
         "holder": clean(body.get("holder"), 120),
+        "owner": clean(body.get("owner"), 120),
+        "payer": body.get("payer") if body.get("payer") in PAYERS else "",
         "note": clean(body.get("note"), 500),
     }
 
@@ -213,7 +216,7 @@ def is_verifying(meter):
 
 # ---------- data ----------
 
-def joined_rows(meter_type, period, search, building):
+def joined_rows(meter_type, period, search, building, owner="", payer=""):
     found = list(meters.find({"type": meter_type}, {"_id": 0}))
     found.sort(key=lambda m: (m.get("building", ""), m.get("meter_no", "")))
     by_meter = {
@@ -225,10 +228,14 @@ def joined_rows(meter_type, period, search, building):
     for meter in found:
         if building and meter.get("building") != building:
             continue
+        if owner and meter.get("owner", "") != owner:
+            continue
+        if payer and (meter.get("payer") or "none") != payer:
+            continue
         if needle:
             past = [e.get("old", "") for e in meter.get("number_log", [])]
             text = " ".join(
-                [str(meter.get(k, "")) for k in ("account_no", "meter_no", "building", "unit", "holder")] + past
+                [str(meter.get(k, "")) for k in ("account_no", "meter_no", "building", "unit", "holder", "owner")] + past
             ).lower()
             if needle not in text:
                 continue
@@ -237,15 +244,16 @@ def joined_rows(meter_type, period, search, building):
         gone = transfer.get("state") == "done" and not bill and period >= transfer.get("done_date", "")[:7]
         rows.append({"meter": meter, "bill": bill, "status": bill_status(bill), "gone": gone,
                      "verifying": is_verifying(meter)})
-    return rows, sorted({m["building"] for m in found if m.get("building")})
+    return rows, sorted({m["building"] for m in found if m.get("building")}), sorted({m["owner"] for m in found if m.get("owner")})
 
 
 def list_view(query):
     meter_type = check_type(query.get("type", ""))
     period = check_period(query.get("month", ""))
     status = query.get("status", "")
-    rows, buildings = joined_rows(
-        meter_type, period, clean(query.get("q"), 80), clean(query.get("building"), 120)
+    rows, buildings, owners = joined_rows(
+        meter_type, period, clean(query.get("q"), 80), clean(query.get("building"), 120),
+        clean(query.get("owner"), 120), clean(query.get("payer"), 10),
     )
     counts = {"none": 0, "unpaid": 0, "overdue": 0, "paid": 0}
     total = paid = 0.0
@@ -283,6 +291,7 @@ def list_view(query):
         "pages": pages,
         "shown": len(shown),
         "buildings": buildings,
+        "owners": owners,
         "summary": {
             "meters": len(live),
             "transfer": len(need_transfer),
@@ -425,17 +434,21 @@ def safe_cell(value):
     return "'" + text if text[:1] in ("=", "+", "-", "@") else text
 
 
+PAYER_AR = {"company": "الشركة", "tenant": "المستأجر"}
 STATUS_AR = {"none": "لا توجد فاتورة", "unpaid": "غير مسددة", "overdue": "متأخرة", "paid": "مسددة"}
 
 
 def export_csv(query):
     meter_type = check_type(query.get("type", ""))
     period = check_period(query.get("month", ""))
-    rows, _ = joined_rows(meter_type, period, "", "")
+    rows, _, _ = joined_rows(
+        meter_type, period, clean(query.get("q"), 80), clean(query.get("building"), 120),
+        clean(query.get("owner"), 120), clean(query.get("payer"), 10),
+    )
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow([
-        "رقم العداد", "رقم الحساب", "المبنى", "الوحدة", "صاحب الحساب", "الشهر",
+        "رقم العداد", "رقم الحساب", "المبنى", "الوحدة", "صاحب الحساب", "المالك", "المسؤول عن السداد", "الشهر",
         "المبلغ", "تاريخ الاستحقاق", "رقم الفاتورة", "الحالة", "تاريخ السداد", "ملاحظات", "نقل الحساب",
     ])
     for row in rows:
@@ -445,7 +458,8 @@ def export_csv(query):
         meter, bill = row["meter"], row["bill"] or {}
         writer.writerow([safe_cell(v) for v in (
             meter.get("meter_no"), meter.get("account_no"), meter.get("building"),
-            meter.get("unit"), meter.get("holder"), period, bill.get("amount", ""),
+            meter.get("unit"), meter.get("holder"), meter.get("owner", ""),
+            PAYER_AR.get(meter.get("payer") or "", ""), period, bill.get("amount", ""),
             bill.get("due_date", ""), bill.get("bill_no", ""), STATUS_AR[row["status"]],
             bill.get("paid_date", ""), bill.get("note", ""),
             "قيد التوثيق - بانتظار رقم الحساب الجديد" if row["verifying"] else
@@ -537,6 +551,8 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
 td small{display:block;color:var(--muted);font-size:13px}
 .m{background:none;border:0;padding:0;font-weight:600;color:var(--accent);text-decoration:underline;font-variant-numeric:tabular-nums}
 .st{font-size:13.5px;font-weight:600;white-space:nowrap}
+.payer{font-size:13px;font-weight:600;padding:1px 8px;border-radius:3px;white-space:nowrap;background:#e1f2ee;color:#0c5a50}
+.payer.tenant{background:#eceff1;color:var(--muted)}
 .st.paid{color:var(--paid)}.st.unpaid{color:var(--unpaid)}.st.overdue{color:var(--overdue)}.st.none{color:var(--none)}
 .acts{display:flex;gap:6px;justify-content:flex-end;flex-wrap:nowrap}
 .acts .btn{padding:5px 11px;font-size:13.5px;white-space:nowrap}
@@ -552,7 +568,7 @@ dialog::backdrop{background:rgba(23,38,47,.55)}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .f{display:grid;gap:4px}.f.full{grid-column:1/-1}
 .f label{font-size:13.5px;color:var(--muted)}
-.f input,.f textarea{padding:9px 11px;border:1px solid #aab7bf;border-radius:3px;width:100%;background:#fff}
+.f input,.f textarea,.f select{padding:9px 11px;border:1px solid #aab7bf;border-radius:3px;width:100%;background:#fff}
 .check{display:flex;align-items:center;gap:8px;grid-column:1/-1;font-weight:500}
 .check input{width:18px;height:18px}
 .err{color:var(--overdue);font-size:14px;margin:12px 0 0;min-height:0}
@@ -637,6 +653,8 @@ body[data-ro] #histEdit,body[data-ro] #histVacate,body[data-ro] .xs,body[data-ro
   <div class="bar">
     <input id="q" type="search">
     <select id="building"></select>
+    <select id="owner"></select>
+    <select id="payer"></select>
     <button class="btn" id="export"></button>
     <button class="btn" id="addVerify" data-t="add_verify"></button>
     <button class="btn main" id="addMeter"></button>
@@ -656,6 +674,8 @@ body[data-ro] #histEdit,body[data-ro] #histVacate,body[data-ro] .xs,body[data-ro
     <div class="f" id="sinceWrap" hidden><label for="mSince" data-t="verify_since"></label><input id="mSince" type="date"></div>
     <div class="f" id="unitWrap"><label for="mUnit" data-t="unit"></label><input id="mUnit" maxlength="60"></div>
     <div class="f full" id="holderWrap"><label for="mHolder" data-t="holder"></label><input id="mHolder" maxlength="120"></div>
+    <div class="f"><label for="mOwner" data-t="owner"></label><input id="mOwner" maxlength="120" list="ownerList"><datalist id="ownerList"></datalist></div>
+    <div class="f"><label for="mPayer" data-t="payer"></label><select id="mPayer" class="pick"><option value="company" data-t="payer_company"></option><option value="tenant" data-t="payer_tenant"></option></select></div>
     <div class="f full"><label for="mNote" data-t="note"></label><textarea id="mNote" rows="2" maxlength="500"></textarea></div>
   </div>
   <p class="err" id="meterErr"></p>
@@ -737,8 +757,8 @@ title:"العدادات",electricity:"الكهرباء",water:"المياه",lan
 provider_electricity:"السعودية للطاقة",provider_water:"شركة المياه الوطنية",wareef:"وريف",logo_pending:"شعار",
 sar:"ر.س",month_total:"إجمالي فواتير الشهر",paid_of:"المسدد",of:"من",meter_word:"عداد",
 all:"الكل",none:"لا توجد فاتورة",unpaid:"غير مسددة",overdue:"متأخرة",paid:"مسددة",
-search:"ابحث برقم العداد أو الحساب (الحالي أو القديم) أو المبنى",all_buildings:"كل المباني",export_btn:"تصدير إلى Excel",add_meter:"إضافة عداد",
-meter_no:"رقم العداد",account_no:"رقم الحساب",building:"المبنى",unit:"الوحدة",holder:"صاحب الحساب",note:"ملاحظات",
+search:"ابحث برقم العداد أو الحساب أو المبنى أو المالك",all_buildings:"كل المباني",export_btn:"تصدير إلى Excel",add_meter:"إضافة عداد",
+meter_no:"رقم العداد",account_no:"رقم الحساب",building:"المبنى",unit:"الوحدة",holder:"صاحب الحساب",owner:"المالك",payer:"المسؤول عن السداد",payer_short:"السداد",payer_company:"الشركة",payer_tenant:"المستأجر (عداد مستقل)",payer_tenant_short:"المستأجر",payer_none:"غير محدد",all_owners:"كل الملاك",all_payers:"الشركة والمستأجر",note:"ملاحظات",
 amount:"المبلغ (ر.س)",due_date:"تاريخ الاستحقاق",bill_no:"رقم الفاتورة",is_paid:"تم السداد",paid_date:"تاريخ السداد",
 status:"الحالة",actions:"",enter_bill:"إدخال الفاتورة",edit_bill:"تعديل",mark_paid:"تسديد",
 save_meter:"حفظ العداد",save_bill:"حفظ",save_next:"حفظ والتالي",cancel:"إلغاء",close:"إغلاق",delete_meter:"حذف العداد",delete_bill:"حذف الفاتورة",edit_meter:"تعديل بيانات العداد",
@@ -755,8 +775,8 @@ title:"Meters",electricity:"Electricity",water:"Water",langBtn:"العربية",
 provider_electricity:"SE",provider_water:"National Water Company",wareef:"Wareef",logo_pending:"Logo",
 sar:"SAR",month_total:"Bills this month",paid_of:"Paid",of:"of",meter_word:"meters",
 all:"All",none:"No bill yet",unpaid:"Unpaid",overdue:"Overdue",paid:"Paid",
-search:"Search by meter, account (current or old) or building",all_buildings:"All buildings",export_btn:"Export to Excel",add_meter:"Add meter",
-meter_no:"Meter number",account_no:"Account number",building:"Building",unit:"Unit",holder:"Account holder",note:"Notes",
+search:"Search by meter, account, building or owner",all_buildings:"All buildings",export_btn:"Export to Excel",add_meter:"Add meter",
+meter_no:"Meter number",account_no:"Account number",building:"Building",unit:"Unit",holder:"Account holder",owner:"Owner",payer:"Who pays",payer_short:"Paid by",payer_company:"Company",payer_tenant:"Tenant (own meter)",payer_tenant_short:"Tenant",payer_none:"Not set",all_owners:"All owners",all_payers:"Company and tenant",note:"Notes",
 amount:"Amount (SAR)",due_date:"Due date",bill_no:"Bill number",is_paid:"Paid",paid_date:"Payment date",
 status:"Status",actions:"",enter_bill:"Enter bill",edit_bill:"Edit",mark_paid:"Mark paid",
 save_meter:"Save meter",save_bill:"Save",save_next:"Save and next",cancel:"Cancel",close:"Close",delete_meter:"Delete meter",delete_bill:"Delete bill",edit_meter:"Edit meter details",
@@ -771,7 +791,7 @@ need_meter_no:"Enter the meter number.",need_due_date:"Enter the due date.",bad_
 }};
 function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
 var now=new Date(),S={lang:store("lang")==="en"?"en":"ar",type:store("type")==="water"?"water":"electricity",
-month:now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0"),status:"",q:"",building:"",page:1,data:null};
+month:now.getFullYear()+"-"+String(now.getMonth()+1).padStart(2,"0"),status:"",q:"",building:"",owner:"",payer:"",page:1,data:null};
 function t(k){return T[S.lang][k]!==undefined?T[S.lang][k]:k}
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
@@ -809,7 +829,7 @@ function chrome(){
  $("monthName").textContent=monthLabel(S.month);
 }
 function load(){
- var u="/api/list?"+new URLSearchParams({type:S.type,month:S.month,status:S.status,q:S.q,building:S.building,page:S.page});
+ var u="/api/list?"+new URLSearchParams({type:S.type,month:S.month,status:S.status,q:S.q,building:S.building,owner:S.owner,payer:S.payer,page:S.page});
  var ticket=load.n=(load.n||0)+1;
  return api("GET",u).then(function(d){if(ticket!==load.n)return;S.data=d;S.page=d.page;render()},function(e){toast(e.key)});
 }
@@ -828,26 +848,33 @@ function render(){
  $("chips").innerHTML=c.map(function(x){return '<button class="chip '+x[2]+'" data-status="'+x[0]+'" aria-pressed="'+(S.status===x[0])+'"><span>'+esc(t(x[2]))+"</span><b>"+x[1]+"</b></button>"}).join("");
  var opts='<option value="">'+esc(t("all_buildings"))+"</option>"+d.buildings.map(function(b){return '<option value="'+esc(b)+'"'+(b===S.building?" selected":"")+">"+esc(b)+"</option>"}).join("");
  $("building").innerHTML=opts;$("building").setAttribute("aria-label",t("building"));
+ var owners=d.owners||[];if(S.owner&&owners.indexOf(S.owner)<0)owners=owners.concat([S.owner]);
+ $("owner").innerHTML='<option value="">'+esc(t("all_owners"))+"</option>"+owners.map(function(o){return '<option value="'+esc(o)+'"'+(o===S.owner?" selected":"")+">"+esc(o)+"</option>"}).join("");
+ $("owner").setAttribute("aria-label",t("owner"));$("owner").hidden=!owners.length;
+ $("payer").innerHTML=[["","all_payers"],["company","payer_company"],["tenant","payer_tenant_short"],["none","payer_none"]].map(function(o){return '<option value="'+o[0]+'"'+(o[0]===S.payer?" selected":"")+">"+esc(t(o[1]))+"</option>"}).join("");
+ $("payer").setAttribute("aria-label",t("payer"));
+ $("ownerList").innerHTML=(d.owners||[]).map(function(o){return '<option value="'+esc(o)+'">'}).join("");
  $("bldList").innerHTML=d.buildings.map(function(b){return '<option value="'+esc(b)+'">'}).join("");
  if(S.status==="verify"){renderVerify(d);return renderPager(d)}
  if(!d.rows.length){
-  var virgin=!s.meters&&!S.q&&!S.building;
+  var virgin=!s.meters&&!S.q&&!S.building&&!S.owner&&!S.payer;
   $("list").innerHTML='<div class="empty"><b>'+esc(t(virgin?"empty_title":"nomatch_title"))+"</b>"+esc(t(virgin?"empty_body":"nomatch_body"))+"</div>";
  }else{
   var L=function(k){return ' data-l="'+esc(t(k))+'"'};
-  $("list").innerHTML="<table><thead><tr><th>"+[t("meter_no"),t("building"),t("holder"),t("amount"),t("due_date"),t("status"),""].map(esc).join("</th><th>")+"</th></tr></thead><tbody>"+
+  $("list").innerHTML="<table><thead><tr><th>"+[t("meter_no"),t("building"),t("holder"),t("payer_short"),t("amount"),t("due_date"),t("status"),""].map(esc).join("</th><th>")+"</th></tr></thead><tbody>"+
   d.rows.map(function(r,i){var m=r.meter,b=r.bill||{},st=r.status,act,tr=m.transfer||{};
    if(r.gone)act="";
    else if(st==="none")act='<button class="btn main" data-bill="'+i+'">'+esc(t("enter_bill"))+"</button>";
    else{act=(st!=="paid"?'<button class="btn main" data-pay="'+i+'">'+esc(t("mark_paid"))+"</button>":"")+'<button class="btn" data-bill="'+i+'">'+esc(t("edit_bill"))+"</button>"}
    return "<tr><td"+L("meter_no")+'><span><button class="m" data-hist="'+i+'" dir="ltr">'+esc(m.meter_no)+"</button><small>"+esc(t("account_short"))+' <bdi dir="ltr">'+esc(m.account_no)+"</bdi></small></span></td>"+
    "<td"+L("building")+"><span>"+esc(m.building||"")+(m.unit?"<small>"+esc(m.unit)+"</small>":"")+"</span></td>"+
-   "<td"+L("holder")+">"+esc(m.holder||"")+"</td>"+
+   "<td"+L("holder")+"><span>"+esc(m.holder||"")+(m.owner?"<small>"+esc(t("owner"))+": "+esc(m.owner)+"</small>":"")+"</span></td>"+
+   "<td"+L("payer_short")+">"+(m.payer?'<span class="payer '+m.payer+'">'+esc(t(m.payer==="tenant"?"payer_tenant_short":"payer_company"))+"</span>":"")+"</td>"+
    '<td class="num"'+L("amount")+">"+(r.bill?money(b.amount):"")+"</td>"+
    '<td class="num"'+L("due_date")+">"+esc(b.due_date||"")+"</td>"+
    "<td"+L("status")+'><span class="st '+st+'">'+esc(r.gone?t("transferred_chip"):t(st))+(b.paid_date?'<small class="num">'+esc(b.paid_date)+"</small>":"")+"</span></td>"+
    '<td class="a"><div class="acts">'+act+"</div></td></tr>"+
-   (tr.state==="pending"?'<tr class="flag"><td colspan="7"><div class="row"><span>'+esc(t("vacated_msg"))+(tr.new_owner?" ("+esc(t("new_owner"))+": "+esc(tr.new_owner)+")":"")+'</span><button class="btn" data-hist="'+i+'">'+esc(t("transfer_done_btn"))+"</button></div></td></tr>":"")}).join("")+"</tbody></table>";
+   (tr.state==="pending"?'<tr class="flag"><td colspan="8"><div class="row"><span>'+esc(t("vacated_msg"))+(tr.new_owner?" ("+esc(t("new_owner"))+": "+esc(tr.new_owner)+")":"")+'</span><button class="btn" data-hist="'+i+'">'+esc(t("transfer_done_btn"))+"</button></div></td></tr>":"")}).join("")+"</tbody></table>";
  }
  renderPager(d);
 }
@@ -880,18 +907,19 @@ function openMeter(m,verify){editing=m||null;verifyMode=!m&&!!verify;$("meterErr
  $("unitWrap").hidden=verifyMode;$("holderWrap").hidden=verifyMode;
  $("mNo").value=m?m.meter_no:"";$("mAcc").value=m?m.account_no||"":"";$("mChange").value=todayStr();$("changeWrap").hidden=true;$("mBld").value=m?m.building||"":(S.building||"");
  $("mUnit").value=m?m.unit||"":"";$("mHolder").value=m?m.holder||"":"";$("mNote").value=m?m.note||"":"";
+ $("mOwner").value=m?m.owner||"":(S.owner||"");$("mPayer").value=m?(m.payer||"company"):(S.payer==="tenant"?"tenant":"company");
  $("meterDel").hidden=!m;show("meterDlg");$("mNo").focus();
 }
 function numbersChanged(){return !!editing&&($("mNo").value.trim()!==editing.meter_no||$("mAcc").value.trim()!==editing.account_no||$("mHolder").value.trim()!==(editing.holder||""))}
 ["mNo","mAcc","mHolder"].forEach(function(id){$(id).addEventListener("input",function(){$("changeWrap").hidden=!numbersChanged()})});
 $("meterForm").addEventListener("submit",function(e){e.preventDefault();
- var body={type:S.type,meter_no:$("mNo").value,account_no:$("mAcc").value,building:$("mBld").value,unit:$("mUnit").value,holder:$("mHolder").value,note:$("mNote").value,change_date:$("mChange").value};
+ var body={type:S.type,meter_no:$("mNo").value,account_no:$("mAcc").value,building:$("mBld").value,unit:$("mUnit").value,holder:$("mHolder").value,owner:$("mOwner").value,payer:$("mPayer").value,note:$("mNote").value,change_date:$("mChange").value};
  if(verifyMode){body.verifying=true;body.since=$("mSince").value;body.unit="";body.holder=""}
  var keepOpen=!editing&&!verifyMode,wasVerify=verifyMode;
  (editing?api("PUT","/api/meters/"+editing.id,body):api("POST","/api/meters",body)).then(function(){
   toast(wasVerify?"verify_saved":"meter_saved");
   if(wasVerify){S.status="verify";S.page=1}
-  if(keepOpen){var bld=$("mBld").value,hld=$("mHolder").value;openMeter(null);$("mBld").value=bld;$("mHolder").value=hld}else $("meterDlg").close();
+  if(keepOpen){var bld=$("mBld").value,hld=$("mHolder").value,own=$("mOwner").value,pay=$("mPayer").value;openMeter(null);$("mBld").value=bld;$("mHolder").value=hld;$("mOwner").value=own;$("mPayer").value=pay}else $("meterDlg").close();
   load();
  },function(er){$("meterErr").textContent=t(er.key)});
 });
@@ -992,7 +1020,7 @@ document.addEventListener("click",function(e){
  var x=el.dataset;
  if(x.act!==undefined)openActivate(S.data.rows[+x.act].meter);
  else if(x.log){if(confirm(t("confirm_log")))api("DELETE","/api/meters/"+billMeter.id+"/log/"+x.log).then(function(){toast("log_removed");showHist(billMeter);load()},function(er){toast(er.key)})}
- else if(x.tab){if(S.type!==x.tab){S.type=x.tab;store("type",S.type);S.status="";S.q="";S.building="";S.page=1;$("q").value="";refresh()}}
+ else if(x.tab){if(S.type!==x.tab){S.type=x.tab;store("type",S.type);S.status="";S.q="";S.building="";S.owner="";S.payer="";S.page=1;$("q").value="";refresh()}}
  else if(x.status!==undefined){S.status=x.status;S.page=1;load()}
  else if(x.bill!==undefined)openBill(+x.bill);
  else if(x.hist!==undefined)openHist(+x.hist);
@@ -1005,8 +1033,10 @@ $("next").addEventListener("click",function(){S.month=shift(S.month,1);S.page=1;
 $("lang").addEventListener("click",function(){S.lang=S.lang==="ar"?"en":"ar";store("lang",S.lang);chrome();if(S.data)render()});
 $("addMeter").addEventListener("click",function(){openMeter(null)});
 $("addVerify").addEventListener("click",function(){openMeter(null,true)});
-$("export").addEventListener("click",function(){location.href="/api/export?"+new URLSearchParams({type:S.type,month:S.month})});
+$("export").addEventListener("click",function(){location.href="/api/export?"+new URLSearchParams({type:S.type,month:S.month,q:S.q,building:S.building,owner:S.owner,payer:S.payer})});
 $("building").addEventListener("change",function(){S.building=this.value;S.page=1;load()});
+$("owner").addEventListener("change",function(){S.owner=this.value;S.page=1;load()});
+$("payer").addEventListener("change",function(){S.payer=this.value;S.page=1;load()});
 var qT;$("q").addEventListener("input",function(){var v=this.value;clearTimeout(qT);qT=setTimeout(function(){S.q=v.trim();S.page=1;load()},250)});
 refresh();
 </script>
