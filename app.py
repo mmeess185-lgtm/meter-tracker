@@ -177,6 +177,11 @@ def bill_status(bill):
     return "unpaid"
 
 
+def is_verifying(meter):
+    """True while the meter is registered in our name and still waits for its new account number."""
+    return (meter.get("verify") or {}).get("state") == "pending"
+
+
 # ---------- data ----------
 
 def joined_rows(meter_type, period, search, building):
@@ -201,7 +206,8 @@ def joined_rows(meter_type, period, search, building):
         bill = by_meter.get(meter["id"])
         transfer = meter.get("transfer") or {}
         gone = transfer.get("state") == "done" and not bill and period >= transfer.get("done_date", "")[:7]
-        rows.append({"meter": meter, "bill": bill, "status": bill_status(bill), "gone": gone})
+        rows.append({"meter": meter, "bill": bill, "status": bill_status(bill), "gone": gone,
+                     "verifying": is_verifying(meter)})
     return rows, sorted({m["building"] for m in found if m.get("building")})
 
 
@@ -214,17 +220,21 @@ def list_view(query):
     )
     counts = {"none": 0, "unpaid": 0, "overdue": 0, "paid": 0}
     total = paid = 0.0
-    live = [r for r in rows if not r["gone"]]
+    verifying = [r for r in rows if r["verifying"]]
+    verifying.sort(key=lambda r: (r["meter"].get("verify") or {}).get("since", ""))
+    live = [r for r in rows if not r["gone"] and not r["verifying"]]
     state = lambda r: (r["meter"].get("transfer") or {}).get("state")
     need_transfer = [r for r in live if state(r) == "pending"]
-    transferred = [r for r in rows if state(r) == "done"]
+    transferred = [r for r in rows if state(r) == "done" and not r["verifying"]]
     for row in live:
         counts[row["status"]] += 1
         if row["bill"]:
             total += row["bill"].get("amount", 0)
             if row["bill"].get("paid"):
                 paid += row["bill"].get("amount", 0)
-    if status == "transfer":
+    if status == "verify":
+        shown = verifying
+    elif status == "transfer":
         shown = need_transfer
     elif status == "transferred":
         shown = transferred
@@ -248,6 +258,7 @@ def list_view(query):
             "meters": len(live),
             "transfer": len(need_transfer),
             "transferred": len(transferred),
+            "verify": len(verifying),
             "counts": counts,
             "total": round(total, 2),
             "paid": round(paid, 2),
@@ -319,6 +330,30 @@ def meter_history(meter_id):
     }
 
 
+def activate_meter(meter_id, body):
+    """Puts the new account number on a meter waiting for registration and makes it active."""
+    meter = meters.find_one({"id": meter_id}, {"_id": 0})
+    if not meter:
+        raise BadInput("meter_gone")
+    if not is_verifying(meter):
+        raise BadInput("not_verifying")
+    new_account = clean(body.get("account_no"), 60)
+    if not new_account:
+        raise BadInput("need_new_account")
+    done_date = check_date(body.get("date")) or today()
+    update = {
+        "$set": {"account_no": new_account, "verified_date": done_date},
+        "$unset": {"verify": ""},
+    }
+    if meter.get("account_no", "") != new_account:
+        update["$push"] = {"number_log": {
+            "id": uuid.uuid4().hex, "field": "account_no", "old": meter.get("account_no", ""),
+            "new": new_account, "date": done_date,
+            "logged": datetime.now(timezone.utc).isoformat(),
+        }}
+    meters.update_one({"id": meter_id}, update)
+
+
 def change_transfer(meter_id, body):
     meter = meters.find_one({"id": meter_id}, {"_id": 0})
     if not meter:
@@ -384,6 +419,7 @@ def export_csv(query):
             meter.get("unit"), meter.get("holder"), period, bill.get("amount", ""),
             bill.get("due_date", ""), bill.get("bill_no", ""), STATUS_AR[row["status"]],
             bill.get("paid_date", ""), bill.get("note", ""),
+            "قيد التوثيق - بانتظار رقم الحساب الجديد" if row["verifying"] else
             {"pending": "تم إخلاء الشقة - بانتظار نقل الحساب", "done": "تم نقل الحساب"}.get(transfer_state, ""),
         )])
     return ("﻿" + out.getvalue()).encode("utf-8")
@@ -568,6 +604,7 @@ dialog::backdrop{background:rgba(23,38,47,.55)}
     <input id="q" type="search">
     <select id="building"></select>
     <button class="btn" id="export"></button>
+    <button class="btn" id="addVerify" data-t="add_verify"></button>
     <button class="btn main" id="addMeter"></button>
   </div>
 
@@ -579,11 +616,12 @@ dialog::backdrop{background:rgba(23,38,47,.55)}
   <h2 id="meterTitle"></h2><p class="ctx" id="meterCtx"></p>
   <div class="grid">
     <div class="f"><label for="mNo" data-t="meter_no"></label><input id="mNo" required maxlength="60" dir="ltr"></div>
-    <div class="f"><label for="mAcc" data-t="account_no"></label><input id="mAcc" required maxlength="60" dir="ltr"></div>
+    <div class="f"><label for="mAcc" id="mAccL"></label><input id="mAcc" required maxlength="60" dir="ltr"></div>
     <div class="f full" id="changeWrap" hidden><label for="mChange" data-t="change_date"></label><input id="mChange" type="date"></div>
     <div class="f"><label for="mBld" data-t="building"></label><input id="mBld" maxlength="120" list="bldList"><datalist id="bldList"></datalist></div>
-    <div class="f"><label for="mUnit" data-t="unit"></label><input id="mUnit" maxlength="60"></div>
-    <div class="f full"><label for="mHolder" data-t="holder"></label><input id="mHolder" maxlength="120"></div>
+    <div class="f" id="sinceWrap" hidden><label for="mSince" data-t="verify_since"></label><input id="mSince" type="date"></div>
+    <div class="f" id="unitWrap"><label for="mUnit" data-t="unit"></label><input id="mUnit" maxlength="60"></div>
+    <div class="f full" id="holderWrap"><label for="mHolder" data-t="holder"></label><input id="mHolder" maxlength="120"></div>
     <div class="f full"><label for="mNote" data-t="note"></label><textarea id="mNote" rows="2" maxlength="500"></textarea></div>
   </div>
   <p class="err" id="meterErr"></p>
@@ -629,6 +667,20 @@ dialog::backdrop{background:rgba(23,38,47,.55)}
   </div>
 </div></dialog>
 
+<dialog id="actDlg"><form class="dlg" method="dialog" id="actForm" novalidate>
+  <h2 data-t="activate_title"></h2><p class="ctx" id="actCtx"></p>
+  <div class="grid">
+    <div class="f"><label data-t="old_account"></label><input id="actOld" dir="ltr" readonly tabindex="-1" style="background:var(--bg)"></div>
+    <div class="f"><label for="actNew" data-t="new_account"></label><input id="actNew" required maxlength="60" dir="ltr" inputmode="numeric"></div>
+    <div class="f"><label for="actDate" data-t="activate_date"></label><input id="actDate" type="date"></div>
+  </div>
+  <p class="err" id="actErr"></p>
+  <div class="foot">
+    <button class="btn main" type="submit" data-t="activate_save"></button>
+    <button class="btn" type="button" data-close="actDlg" data-t="cancel"></button>
+  </div>
+</form></dialog>
+
 <dialog id="trDlg"><form class="dlg" method="dialog" id="trForm" novalidate>
   <h2 id="trTitle"></h2><p class="ctx" id="trCtx"></p>
   <div class="grid">
@@ -657,6 +709,9 @@ amount:"المبلغ (ر.س)",due_date:"تاريخ الاستحقاق",bill_no:"
 status:"الحالة",actions:"",enter_bill:"إدخال الفاتورة",edit_bill:"تعديل",mark_paid:"تسديد",
 save_meter:"حفظ العداد",save_bill:"حفظ",save_next:"حفظ والتالي",cancel:"إلغاء",close:"إغلاق",delete_meter:"حذف العداد",delete_bill:"حذف الفاتورة",edit_meter:"تعديل بيانات العداد",
 new_meter:"إضافة عداد",edit_meter_t:"تعديل بيانات العداد",bill_for:"فاتورة شهر",history:"سجل العداد",no_history:"لم تُسجل أي فاتورة لهذا الحساب بعد.",numbers_log:"سجل التغييرات",bills_log:"الفواتير",no_changes:"لم يتغير رقم العداد أو الحساب أو صاحب الحساب حتى الآن.",change_date:"تاريخ التغيير",account_short:"حساب",remove:"حذف",log_date:"التاريخ",change_col:"التغيير",log_removed:"تم حذف السجل",confirm_log:"هل تريد حذف هذا السجل؟ استخدم هذا فقط لو كان التغيير خطأً مطبعياً.",transfer_chip:"تحتاج نقل حساب",transferred_chip:"تم نقلها",vacated_btn:"تم إخلاء الشقة",vacated_msg:"تم إخلاء الشقة. يرجى تصفية الفاتورة ونقل الحساب باسم المالك الجديد.",vacated_on:"تاريخ الإخلاء",new_owner:"المالك الجديد",transfer_done_btn:"تم نقل الحساب",transfer_cancel_btn:"إلغاء التنبيه",transfer_undo_btn:"إرجاع الحساب",flag_title:"تسجيل إخلاء الشقة",complete_title:"تأكيد نقل الحساب",save_flag:"حفظ التنبيه",save_complete:"تأكيد النقل",done_on:"تاريخ النقل",done_msg:"تم نقل الحساب إلى",on_date:"بتاريخ",unpaid_warn:"فواتير غير مسددة",no_unpaid:"لا توجد فواتير غير مسددة.",confirm_unpaid:"هذا الحساب عليه فواتير غير مسددة. هل تريد تأكيد النقل رغم ذلك؟",confirm_cancel:"هل تريد إلغاء تنبيه نقل الحساب؟",confirm_undo:"هل تريد إرجاع هذا الحساب إلى القائمة؟ لن يتغير اسم صاحب الحساب تلقائياً.",flag_saved:"تم حفظ التنبيه",transfer_saved:"تم نقل الحساب",transfer_cancelled:"تم الإلغاء",need_new_owner:"أدخل اسم المالك الجديد.",need_account_no:"أدخل رقم الحساب.",dup_meter:"رقم العداد هذا مسجل مسبقاً.",
+verify_chip:"قيد التوثيق",add_verify:"عداد قيد التوثيق",verify_new:"إضافة عداد قيد التوثيق",verify_ctx:"بانتظار رقم الحساب الجديد",verify_since:"تاريخ التوثيق",old_account:"رقم الحساب القديم",new_account:"رقم الحساب الجديد",account_now:"رقم الحساب الحالي (القديم)",
+activate_btn:"تحديث رقم الحساب",activate_title:"تحديث رقم الحساب وتفعيل العداد",activate_date:"تاريخ التحديث",activate_save:"حفظ وتفعيل",activated:"تم تحديث الحساب وأصبح العداد نشطاً",verify_saved:"تمت الإضافة إلى قيد التوثيق",
+verify_msg:"العداد قيد التوثيق باسمنا، بانتظار رسالة تحديث رقم الحساب.",waiting:"بانتظار منذ",days:"يوم",today_word:"اليوم",verify_empty_title:"لا توجد عدادات قيد التوثيق",verify_empty_body:"عند طلب توثيق عداد باسمنا اضغط «عداد قيد التوثيق» وأدخل بياناته.",need_new_account:"أدخل رقم الحساب الجديد.",not_verifying:"هذا العداد لم يعد قيد التوثيق.",
 empty_title:"لا توجد عدادات بعد",empty_body:"أضف أول عداد للبدء.",nomatch_title:"لا توجد نتائج",nomatch_body:"غيّر البحث أو الفلتر لعرض عدادات أخرى.",
 page:"صفحة",prev:"السابق",next:"التالي",meter_saved:"تم حفظ العداد",bill_saved:"تم حفظ الفاتورة",bill_paid:"تم تسديد الفاتورة",meter_deleted:"تم حذف العداد",bill_deleted:"تم حذف الفاتورة",
 confirm_meter:"سيتم حذف هذا العداد وكل فواتيره نهائياً. هل تريد المتابعة؟",confirm_bill:"هل تريد حذف فاتورة هذا الشهر؟",
@@ -672,6 +727,9 @@ amount:"Amount (SAR)",due_date:"Due date",bill_no:"Bill number",is_paid:"Paid",p
 status:"Status",actions:"",enter_bill:"Enter bill",edit_bill:"Edit",mark_paid:"Mark paid",
 save_meter:"Save meter",save_bill:"Save",save_next:"Save and next",cancel:"Cancel",close:"Close",delete_meter:"Delete meter",delete_bill:"Delete bill",edit_meter:"Edit meter details",
 new_meter:"Add meter",edit_meter_t:"Edit meter details",bill_for:"Bill for",history:"Meter record",no_history:"No bills recorded for this account yet.",numbers_log:"Change log",bills_log:"Bills",no_changes:"The meter number, account number and holder have not changed.",change_date:"Date of the change",account_short:"Account",remove:"Remove",log_date:"Date",change_col:"Change",log_removed:"Log entry removed",confirm_log:"Remove this log entry? Only do this if the change was a typing mistake.",transfer_chip:"Needs transfer",transferred_chip:"Transferred",vacated_btn:"Apartment vacated",vacated_msg:"Apartment vacated. Settle the bill and transfer the account to the new owner.",vacated_on:"Date vacated",new_owner:"New owner",transfer_done_btn:"Account transferred",transfer_cancel_btn:"Cancel alert",transfer_undo_btn:"Restore account",flag_title:"Record apartment vacated",complete_title:"Confirm account transfer",save_flag:"Save alert",save_complete:"Confirm transfer",done_on:"Transfer date",done_msg:"Account transferred to",on_date:"on",unpaid_warn:"unpaid bills",no_unpaid:"No unpaid bills.",confirm_unpaid:"This account has unpaid bills. Confirm the transfer anyway?",confirm_cancel:"Cancel the transfer alert?",confirm_undo:"Return this account to the list? The account holder name will not change automatically.",flag_saved:"Alert saved",transfer_saved:"Account transferred",transfer_cancelled:"Cancelled",need_new_owner:"Enter the name of the new owner.",need_account_no:"Enter the account number.",dup_meter:"This meter number is already registered.",
+verify_chip:"Registering",add_verify:"Meter being registered",verify_new:"Add meter being registered",verify_ctx:"Waiting for the new account number",verify_since:"Registration date",old_account:"Old account number",new_account:"New account number",account_now:"Current (old) account number",
+activate_btn:"Update account number",activate_title:"Update account number and activate",activate_date:"Date of the update",activate_save:"Save and activate",activated:"Account updated. The meter is now active",verify_saved:"Added to registering",
+verify_msg:"This meter is being registered in our name and is waiting for the account update message.",waiting:"Waiting",days:"days",today_word:"today",verify_empty_title:"No meters being registered",verify_empty_body:"When you are asked to register a meter in our name, press “Meter being registered” and enter its details.",need_new_account:"Enter the new account number.",not_verifying:"This meter is no longer being registered.",
 empty_title:"No meters yet",empty_body:"Add your first meter to get started.",nomatch_title:"No results",nomatch_body:"Change the search or filter to see other meters.",
 page:"Page",prev:"Previous",next:"Next",meter_saved:"Meter saved",bill_saved:"Bill saved",bill_paid:"Bill marked paid",meter_deleted:"Meter deleted",bill_deleted:"Bill deleted",
 confirm_meter:"This permanently deletes the meter and all its bills. Continue?",confirm_bill:"Delete this month's bill?",
@@ -732,10 +790,12 @@ function render(){
  $("sub").innerHTML=esc(t("month_total"))+" "+esc(t("sar"))+" &nbsp;|&nbsp; "+esc(t("paid_of"))+" <b>"+money(s.paid)+"</b>";
  var c=[["",s.meters,"all"],["none",s.counts.none,"none"],["unpaid",s.counts.unpaid,"unpaid"],["overdue",s.counts.overdue,"overdue"],["paid",s.counts.paid,"paid"]];
  var c2=[["transfer",s.transfer,"transfer_chip"],["transferred",s.transferred,"transferred_chip"]];c=c.concat(c2.filter(function(x){return x[1]||S.status===x[0]}));
+ c.push(["verify",s.verify||0,"verify_chip"]);
  $("chips").innerHTML=c.map(function(x){return '<button class="chip '+x[2]+'" data-status="'+x[0]+'" aria-pressed="'+(S.status===x[0])+'"><span>'+esc(t(x[2]))+"</span><b>"+x[1]+"</b></button>"}).join("");
  var opts='<option value="">'+esc(t("all_buildings"))+"</option>"+d.buildings.map(function(b){return '<option value="'+esc(b)+'"'+(b===S.building?" selected":"")+">"+esc(b)+"</option>"}).join("");
  $("building").innerHTML=opts;$("building").setAttribute("aria-label",t("building"));
  $("bldList").innerHTML=d.buildings.map(function(b){return '<option value="'+esc(b)+'">'}).join("");
+ if(S.status==="verify"){renderVerify(d);return renderPager(d)}
  if(!d.rows.length){
   var virgin=!s.meters&&!S.q&&!S.building;
   $("list").innerHTML='<div class="empty"><b>'+esc(t(virgin?"empty_title":"nomatch_title"))+"</b>"+esc(t(virgin?"empty_body":"nomatch_body"))+"</div>";
@@ -755,15 +815,35 @@ function render(){
    '<td class="a"><div class="acts">'+act+"</div></td></tr>"+
    (tr.state==="pending"?'<tr class="flag"><td colspan="7"><div class="row"><span>'+esc(t("vacated_msg"))+(tr.new_owner?" ("+esc(t("new_owner"))+": "+esc(tr.new_owner)+")":"")+'</span><button class="btn" data-hist="'+i+'">'+esc(t("transfer_done_btn"))+"</button></div></td></tr>":"")}).join("")+"</tbody></table>";
  }
+ renderPager(d);
+}
+function daysSince(day){if(!day)return "";var p=day.split("-"),n=Math.round((new Date(todayStr()+"T00:00")-new Date(+p[0],+p[1]-1,+p[2]))/864e5);
+ return n<=0?t("today_word"):n+" "+t("days")}
+function renderVerify(d){
+ if(!d.rows.length){$("list").innerHTML='<div class="empty"><b>'+esc(t("verify_empty_title"))+"</b>"+esc(t("verify_empty_body"))+"</div>";return}
+ var L=function(k){return ' data-l="'+esc(t(k))+'"'};
+ $("list").innerHTML="<table><thead><tr><th>"+[t("building"),t("meter_no"),t("old_account"),t("verify_since"),t("waiting"),""].map(esc).join("</th><th>")+"</th></tr></thead><tbody>"+
+ d.rows.map(function(r,i){var m=r.meter,v=m.verify||{};
+  return "<tr><td"+L("building")+"><span>"+esc(m.building||"")+(m.unit?"<small>"+esc(m.unit)+"</small>":"")+"</span></td>"+
+  "<td"+L("meter_no")+'><button class="m" data-hist="'+i+'" dir="ltr">'+esc(m.meter_no)+"</button></td>"+
+  '<td class="num"'+L("old_account")+'><bdi dir="ltr">'+esc(m.account_no)+"</bdi></td>"+
+  '<td class="num"'+L("verify_since")+">"+esc(v.since||"")+"</td>"+
+  '<td class="num"'+L("waiting")+">"+esc(daysSince(v.since))+"</td>"+
+  '<td class="a"><div class="acts"><button class="btn main" data-act="'+i+'">'+esc(t("activate_btn"))+"</button></div></td></tr>"}).join("")+"</tbody></table>";
+}
+function renderPager(d){
  $("pager").innerHTML=d.pages>1?'<button class="btn" data-page="'+(d.page-1)+'"'+(d.page<=1?" disabled":"")+">"+esc(t("prev"))+"</button><span>"+esc(t("page"))+" "+d.page+" "+esc(t("of"))+" "+d.pages+'</span><button class="btn" data-page="'+(d.page+1)+'"'+(d.page>=d.pages?" disabled":"")+">"+esc(t("next"))+"</button>":"";
 }
 function refresh(){chrome();S.page=Math.max(1,S.page);return load()}
 
 /* meter dialog */
-var editing=null;
-function openMeter(m){editing=m||null;$("meterErr").textContent="";
- $("meterTitle").textContent=t(m?"edit_meter_t":"new_meter");
- $("meterCtx").textContent=t(S.type);
+var editing=null,verifyMode=false;
+function openMeter(m,verify){editing=m||null;verifyMode=!m&&!!verify;$("meterErr").textContent="";
+ $("meterTitle").textContent=t(m?"edit_meter_t":verifyMode?"verify_new":"new_meter");
+ $("meterCtx").textContent=t(S.type)+(verifyMode?" | "+t("verify_ctx"):"");
+ $("mAccL").textContent=t(verifyMode?"account_now":"account_no");
+ $("sinceWrap").hidden=!verifyMode;$("mSince").value=todayStr();
+ $("unitWrap").hidden=verifyMode;$("holderWrap").hidden=verifyMode;
  $("mNo").value=m?m.meter_no:"";$("mAcc").value=m?m.account_no||"":"";$("mChange").value=todayStr();$("changeWrap").hidden=true;$("mBld").value=m?m.building||"":(S.building||"");
  $("mUnit").value=m?m.unit||"":"";$("mHolder").value=m?m.holder||"":"";$("mNote").value=m?m.note||"":"";
  $("meterDel").hidden=!m;show("meterDlg");$("mNo").focus();
@@ -772,9 +852,11 @@ function numbersChanged(){return !!editing&&($("mNo").value.trim()!==editing.met
 ["mNo","mAcc","mHolder"].forEach(function(id){$(id).addEventListener("input",function(){$("changeWrap").hidden=!numbersChanged()})});
 $("meterForm").addEventListener("submit",function(e){e.preventDefault();
  var body={type:S.type,meter_no:$("mNo").value,account_no:$("mAcc").value,building:$("mBld").value,unit:$("mUnit").value,holder:$("mHolder").value,note:$("mNote").value,change_date:$("mChange").value};
- var keepOpen=!editing;
+ if(verifyMode){body.verifying=true;body.since=$("mSince").value;body.unit="";body.holder=""}
+ var keepOpen=!editing&&!verifyMode,wasVerify=verifyMode;
  (editing?api("PUT","/api/meters/"+editing.id,body):api("POST","/api/meters",body)).then(function(){
-  toast("meter_saved");
+  toast(wasVerify?"verify_saved":"meter_saved");
+  if(wasVerify){S.status="verify";S.page=1}
   if(keepOpen){var bld=$("mBld").value,hld=$("mHolder").value;openMeter(null);$("mBld").value=bld;$("mHolder").value=hld}else $("meterDlg").close();
   load();
  },function(er){$("meterErr").textContent=t(er.key)});
@@ -819,10 +901,24 @@ function showHist(m){
    return "<tr>"+cell("",esc(monthLabel(b.period)))+cell(t("account_short"),'<bdi dir="ltr">'+esc(b.account_no||"")+"</bdi>",1)+cell(t("amount"),money(b.amount),1)+cell(t("due_date"),esc(b.due_date||""),1)+cell(t("status"),'<span class="st '+b.status+'">'+esc(t(b.status))+"</span>")+"</tr>"}).join("")+"</tbody></table>";
  },function(e){$("histBody").textContent=t(e.key)});
 }
+/* registration: put the new account number on a meter waiting for it */
+var actMeter=null;
+function openActivate(m){actMeter=m;$("actErr").textContent="";
+ $("actCtx").textContent=[t(S.type),t("meter_no")+" "+m.meter_no,m.building].filter(Boolean).join(" | ");
+ $("actOld").value=m.account_no||"";$("actNew").value="";$("actDate").value=todayStr();show("actDlg");$("actNew").focus();
+}
+$("actForm").addEventListener("submit",function(e){e.preventDefault();
+ api("POST","/api/meters/"+actMeter.id+"/activate",{account_no:$("actNew").value,date:$("actDate").value}).then(function(){
+  $("actDlg").close();toast("activated");if($("histDlg").open)showHist(actMeter);load();
+ },function(er){$("actErr").textContent=t(er.key)});
+});
 var histData=null;
-function renderTransfer(d){histData=d;var tr=d.meter.transfer||{},box=$("transferBox");
- $("histVacate").hidden=!!tr.state;
- if(tr.state==="pending"){
+function renderTransfer(d){histData=d;var tr=d.meter.transfer||{},box=$("transferBox"),v=d.meter.verify||{};
+ $("histVacate").hidden=!!tr.state||v.state==="pending";
+ if(v.state==="pending"){
+  box.innerHTML='<div class="notice"><b>'+esc(t("verify_msg"))+"</b><br>"+esc(t("verify_since"))+": "+esc(v.since)+" ("+esc(daysSince(v.since))+")"+
+  '<div class="foot"><button class="btn main" id="vActivate">'+esc(t("activate_btn"))+"</button></div></div>";
+ }else if(tr.state==="pending"){
   box.innerHTML='<div class="notice"><b>'+esc(t("vacated_msg"))+"</b><br>"+esc(t("vacated_on"))+": "+esc(tr.vacated_date)+(tr.new_owner?" | "+esc(t("new_owner"))+": "+esc(tr.new_owner):"")+"<br>"+
   (d.unpaid_count?esc(t("unpaid_warn")+": "+d.unpaid_count+" | "+money(d.unpaid_total)+" "+t("sar")):esc(t("no_unpaid")))+
   '<div class="foot"><button class="btn main" id="trComplete">'+esc(t("transfer_done_btn"))+'</button><button class="btn" id="trCancel">'+esc(t("transfer_cancel_btn"))+"</button></div></div>";
@@ -844,7 +940,8 @@ $("trForm").addEventListener("submit",function(e){e.preventDefault();
 });
 $("histVacate").addEventListener("click",function(){openTransfer("flag")});
 $("transferBox").addEventListener("click",function(e){
- if(e.target.id==="trComplete")openTransfer("complete");
+ if(e.target.id==="vActivate")openActivate(billMeter);
+ else if(e.target.id==="trComplete")openTransfer("complete");
  else if(e.target.id==="trCancel"){var done=(billMeter.transfer||{}).state==="done";if(confirm(t(done?"confirm_undo":"confirm_cancel")))api("POST","/api/meters/"+billMeter.id+"/transfer",{action:"cancel"}).then(function(){return afterTransfer("transfer_cancelled")},function(er){toast(er.key)})}
 });
 function openHist(i){var m=S.data.rows[i].meter;
@@ -857,9 +954,10 @@ $("histEdit").addEventListener("click",function(){$("histDlg").close();openMeter
 /* events */
 document.addEventListener("click",function(e){
  var c=e.target.closest("[data-close]");if(c){$(c.dataset.close).close();return}
- var el=e.target.closest("[data-tab],[data-status],[data-bill],[data-pay],[data-hist],[data-page],[data-log]");if(!el)return;
+ var el=e.target.closest("[data-tab],[data-status],[data-bill],[data-pay],[data-hist],[data-page],[data-log],[data-act]");if(!el)return;
  var x=el.dataset;
- if(x.log){if(confirm(t("confirm_log")))api("DELETE","/api/meters/"+billMeter.id+"/log/"+x.log).then(function(){toast("log_removed");showHist(billMeter);load()},function(er){toast(er.key)})}
+ if(x.act!==undefined)openActivate(S.data.rows[+x.act].meter);
+ else if(x.log){if(confirm(t("confirm_log")))api("DELETE","/api/meters/"+billMeter.id+"/log/"+x.log).then(function(){toast("log_removed");showHist(billMeter);load()},function(er){toast(er.key)})}
  else if(x.tab){if(S.type!==x.tab){S.type=x.tab;store("type",S.type);S.status="";S.q="";S.building="";S.page=1;$("q").value="";refresh()}}
  else if(x.status!==undefined){S.status=x.status;S.page=1;load()}
  else if(x.bill!==undefined)openBill(+x.bill);
@@ -872,6 +970,7 @@ $("prev").addEventListener("click",function(){S.month=shift(S.month,-1);S.page=1
 $("next").addEventListener("click",function(){S.month=shift(S.month,1);S.page=1;$("monthName").textContent=monthLabel(S.month);load()});
 $("lang").addEventListener("click",function(){S.lang=S.lang==="ar"?"en":"ar";store("lang",S.lang);chrome();if(S.data)render()});
 $("addMeter").addEventListener("click",function(){openMeter(null)});
+$("addVerify").addEventListener("click",function(){openMeter(null,true)});
 $("export").addEventListener("click",function(){location.href="/api/export?"+new URLSearchParams({type:S.type,month:S.month})});
 $("building").addEventListener("change",function(){S.building=this.value;S.page=1;load()});
 var qT;$("q").addEventListener("input",function(){var v=this.value;clearTimeout(qT);qT=setTimeout(function(){S.q=v.trim();S.page=1;load()},250)});
@@ -1063,6 +1162,11 @@ class Handler(BaseHTTPRequestHandler):
             change_transfer(transfer.group(1), self.read_json())
             self.send_json(200, {"ok": True})
             return
+        activate = re.fullmatch(r"/api/meters/([^/]+)/activate", path)
+        if activate:
+            activate_meter(activate.group(1), self.read_json())
+            self.send_json(200, {"ok": True})
+            return
         if path != "/api/meters":
             self.send_json(404, {"error": "server"})
             return
@@ -1072,6 +1176,8 @@ class Handler(BaseHTTPRequestHandler):
         doc["id"] = uuid.uuid4().hex
         doc["created"] = datetime.now(timezone.utc).isoformat()
         doc["number_log"] = []
+        if body.get("verifying"):
+            doc["verify"] = {"state": "pending", "since": check_date(body.get("since")) or today()}
         meters.insert_one(doc)
         doc.pop("_id", None)
         self.send_json(201, {"meter": doc})
