@@ -3,6 +3,8 @@
 Environment variables (set in Render):
   MONGO_URI     database link (same one the other trackers use)
   APP_PASSWORD  optional: if set, people must type it to open the site
+  VIEW_KEY      optional: a long secret word. Anyone who opens <site>/view/<VIEW_KEY>
+                can see everything but change nothing. Change it to cancel the old link.
   PORT          set by Render automatically
 """
 import csv
@@ -28,6 +30,8 @@ from pymongo.errors import DuplicateKeyError
 
 MONGO_URI = os.environ.get("MONGO_URI", "")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+VIEW_KEY = os.environ.get("VIEW_KEY", "").strip()
+VIEW_SECONDS = 30 * 24 * 3600
 DB_NAME = "employee_tracker"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_NAMES = {"wareef", "se", "nwc"}
@@ -101,6 +105,31 @@ def token_valid(token):
         return False
     good = hmac.new(_session_key(), expires.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, good)
+
+
+# View-only sessions are signed with VIEW_KEY, so changing VIEW_KEY ends every one of them.
+
+def _view_key():
+    return hashlib.sha256(b"meter-tracker-view:" + VIEW_KEY.encode("utf-8") + b":" + APP_PASSWORD.encode("utf-8")).digest()
+
+
+def make_view_token():
+    expires = str(int(time.time()) + VIEW_SECONDS)
+    return "v." + expires + "." + hmac.new(_view_key(), expires.encode(), hashlib.sha256).hexdigest()
+
+
+def view_token_valid(token):
+    if not VIEW_KEY or not token or not token.startswith("v."):
+        return False
+    expires, _, sig = token[2:].partition(".")
+    if not expires.isdigit() or int(expires) < time.time():
+        return False
+    good = hmac.new(_view_key(), expires.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, good)
+
+
+def view_key_ok(typed):
+    return bool(VIEW_KEY) and hmac.compare_digest(typed.encode("utf-8"), VIEW_KEY.encode("utf-8"))
 
 
 # ---------- validation ----------
@@ -541,6 +570,10 @@ dialog::backdrop{background:rgba(23,38,47,.55)}
 .xs{background:none;border:0;color:var(--overdue);text-decoration:underline;font-size:13px;padding:0}
 .toast{position:fixed;inset-inline-start:20px;bottom:20px;background:var(--ink);color:#fff;padding:10px 16px;border-radius:3px;z-index:9}
 [hidden]{display:none!important}
+.ro-note{display:none;color:var(--muted);font-size:13.5px;margin-inline-end:auto;padding:2px 6px}
+body[data-ro] .ro-note{display:block}
+body[data-ro] #addMeter,body[data-ro] #addVerify,body[data-ro] .acts,body[data-ro] #transferBox .foot,
+body[data-ro] #histEdit,body[data-ro] #histVacate,body[data-ro] .xs,body[data-ro] .flag button,body[data-ro] td.a{display:none!important}
 
 @media(max-width:760px){
  .top{flex-wrap:wrap;justify-content:space-between}
@@ -574,6 +607,7 @@ dialog::backdrop{background:rgba(23,38,47,.55)}
 <body data-type="electricity">
 <div class="wrap">
   <div class="tools">
+    <span class="ro-note" data-t="read_only_note"></span>
     <button class="link" id="lang"></button>
     <form method="post" action="/logout" style="margin:0"><button class="link" id="logout"></button></form>
   </div>
@@ -709,7 +743,7 @@ amount:"المبلغ (ر.س)",due_date:"تاريخ الاستحقاق",bill_no:"
 status:"الحالة",actions:"",enter_bill:"إدخال الفاتورة",edit_bill:"تعديل",mark_paid:"تسديد",
 save_meter:"حفظ العداد",save_bill:"حفظ",save_next:"حفظ والتالي",cancel:"إلغاء",close:"إغلاق",delete_meter:"حذف العداد",delete_bill:"حذف الفاتورة",edit_meter:"تعديل بيانات العداد",
 new_meter:"إضافة عداد",edit_meter_t:"تعديل بيانات العداد",bill_for:"فاتورة شهر",history:"سجل العداد",no_history:"لم تُسجل أي فاتورة لهذا الحساب بعد.",numbers_log:"سجل التغييرات",bills_log:"الفواتير",no_changes:"لم يتغير رقم العداد أو الحساب أو صاحب الحساب حتى الآن.",change_date:"تاريخ التغيير",account_short:"حساب",remove:"حذف",log_date:"التاريخ",change_col:"التغيير",log_removed:"تم حذف السجل",confirm_log:"هل تريد حذف هذا السجل؟ استخدم هذا فقط لو كان التغيير خطأً مطبعياً.",transfer_chip:"تحتاج نقل حساب",transferred_chip:"تم نقلها",vacated_btn:"تم إخلاء الشقة",vacated_msg:"تم إخلاء الشقة. يرجى تصفية الفاتورة ونقل الحساب باسم المالك الجديد.",vacated_on:"تاريخ الإخلاء",new_owner:"المالك الجديد",transfer_done_btn:"تم نقل الحساب",transfer_cancel_btn:"إلغاء التنبيه",transfer_undo_btn:"إرجاع الحساب",flag_title:"تسجيل إخلاء الشقة",complete_title:"تأكيد نقل الحساب",save_flag:"حفظ التنبيه",save_complete:"تأكيد النقل",done_on:"تاريخ النقل",done_msg:"تم نقل الحساب إلى",on_date:"بتاريخ",unpaid_warn:"فواتير غير مسددة",no_unpaid:"لا توجد فواتير غير مسددة.",confirm_unpaid:"هذا الحساب عليه فواتير غير مسددة. هل تريد تأكيد النقل رغم ذلك؟",confirm_cancel:"هل تريد إلغاء تنبيه نقل الحساب؟",confirm_undo:"هل تريد إرجاع هذا الحساب إلى القائمة؟ لن يتغير اسم صاحب الحساب تلقائياً.",flag_saved:"تم حفظ التنبيه",transfer_saved:"تم نقل الحساب",transfer_cancelled:"تم الإلغاء",need_new_owner:"أدخل اسم المالك الجديد.",need_account_no:"أدخل رقم الحساب.",dup_meter:"رقم العداد هذا مسجل مسبقاً.",
-verify_chip:"قيد التوثيق",add_verify:"عداد قيد التوثيق",verify_new:"إضافة عداد قيد التوثيق",verify_ctx:"بانتظار رقم الحساب الجديد",verify_since:"تاريخ التوثيق",old_account:"رقم الحساب القديم",new_account:"رقم الحساب الجديد",account_now:"رقم الحساب الحالي (القديم)",
+read_only_note:"عرض فقط، لا يمكن التعديل",read_only:"هذا الرابط للعرض فقط ولا يسمح بالتعديل.",verify_chip:"قيد التوثيق",add_verify:"عداد قيد التوثيق",verify_new:"إضافة عداد قيد التوثيق",verify_ctx:"بانتظار رقم الحساب الجديد",verify_since:"تاريخ التوثيق",old_account:"رقم الحساب القديم",new_account:"رقم الحساب الجديد",account_now:"رقم الحساب الحالي (القديم)",
 activate_btn:"تحديث رقم الحساب",activate_title:"تحديث رقم الحساب وتفعيل العداد",activate_date:"تاريخ التحديث",activate_save:"حفظ وتفعيل",activated:"تم تحديث الحساب وأصبح العداد نشطاً",verify_saved:"تمت الإضافة إلى قيد التوثيق",
 verify_msg:"العداد قيد التوثيق باسمنا، بانتظار رسالة تحديث رقم الحساب.",waiting:"بانتظار منذ",days:"يوم",today_word:"اليوم",verify_empty_title:"لا توجد عدادات قيد التوثيق",verify_empty_body:"عند طلب توثيق عداد باسمنا اضغط «عداد قيد التوثيق» وأدخل بياناته.",need_new_account:"أدخل رقم الحساب الجديد.",not_verifying:"هذا العداد لم يعد قيد التوثيق.",
 empty_title:"لا توجد عدادات بعد",empty_body:"أضف أول عداد للبدء.",nomatch_title:"لا توجد نتائج",nomatch_body:"غيّر البحث أو الفلتر لعرض عدادات أخرى.",
@@ -727,7 +761,7 @@ amount:"Amount (SAR)",due_date:"Due date",bill_no:"Bill number",is_paid:"Paid",p
 status:"Status",actions:"",enter_bill:"Enter bill",edit_bill:"Edit",mark_paid:"Mark paid",
 save_meter:"Save meter",save_bill:"Save",save_next:"Save and next",cancel:"Cancel",close:"Close",delete_meter:"Delete meter",delete_bill:"Delete bill",edit_meter:"Edit meter details",
 new_meter:"Add meter",edit_meter_t:"Edit meter details",bill_for:"Bill for",history:"Meter record",no_history:"No bills recorded for this account yet.",numbers_log:"Change log",bills_log:"Bills",no_changes:"The meter number, account number and holder have not changed.",change_date:"Date of the change",account_short:"Account",remove:"Remove",log_date:"Date",change_col:"Change",log_removed:"Log entry removed",confirm_log:"Remove this log entry? Only do this if the change was a typing mistake.",transfer_chip:"Needs transfer",transferred_chip:"Transferred",vacated_btn:"Apartment vacated",vacated_msg:"Apartment vacated. Settle the bill and transfer the account to the new owner.",vacated_on:"Date vacated",new_owner:"New owner",transfer_done_btn:"Account transferred",transfer_cancel_btn:"Cancel alert",transfer_undo_btn:"Restore account",flag_title:"Record apartment vacated",complete_title:"Confirm account transfer",save_flag:"Save alert",save_complete:"Confirm transfer",done_on:"Transfer date",done_msg:"Account transferred to",on_date:"on",unpaid_warn:"unpaid bills",no_unpaid:"No unpaid bills.",confirm_unpaid:"This account has unpaid bills. Confirm the transfer anyway?",confirm_cancel:"Cancel the transfer alert?",confirm_undo:"Return this account to the list? The account holder name will not change automatically.",flag_saved:"Alert saved",transfer_saved:"Account transferred",transfer_cancelled:"Cancelled",need_new_owner:"Enter the name of the new owner.",need_account_no:"Enter the account number.",dup_meter:"This meter number is already registered.",
-verify_chip:"Registering",add_verify:"Meter being registered",verify_new:"Add meter being registered",verify_ctx:"Waiting for the new account number",verify_since:"Registration date",old_account:"Old account number",new_account:"New account number",account_now:"Current (old) account number",
+read_only_note:"View only. Changes are turned off",read_only:"This link is view only and cannot make changes.",verify_chip:"Registering",add_verify:"Meter being registered",verify_new:"Add meter being registered",verify_ctx:"Waiting for the new account number",verify_since:"Registration date",old_account:"Old account number",new_account:"New account number",account_now:"Current (old) account number",
 activate_btn:"Update account number",activate_title:"Update account number and activate",activate_date:"Date of the update",activate_save:"Save and activate",activated:"Account updated. The meter is now active",verify_saved:"Added to registering",
 verify_msg:"This meter is being registered in our name and is waiting for the account update message.",waiting:"Waiting",days:"days",today_word:"today",verify_empty_title:"No meters being registered",verify_empty_body:"When you are asked to register a meter in our name, press “Meter being registered” and enter its details.",need_new_account:"Enter the new account number.",not_verifying:"This meter is no longer being registered.",
 empty_title:"No meters yet",empty_body:"Add your first meter to get started.",nomatch_title:"No results",nomatch_body:"Change the search or filter to see other meters.",
@@ -1019,15 +1053,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
 
-    def signed_in(self):
-        if not APP_PASSWORD:
-            return True
-        raw = self.headers.get("Cookie", "")
+    def role(self):
+        """'edit', 'view' (opened through the view-only link) or None (not signed in)."""
         try:
-            jar = SimpleCookie(raw)
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
         except Exception:
-            return False
-        return COOKIE_NAME in jar and token_valid(jar[COOKIE_NAME].value)
+            jar = {}
+        token = jar[COOKIE_NAME].value if COOKIE_NAME in jar else ""
+        if view_token_valid(token):
+            return "view"
+        if not APP_PASSWORD or token_valid(token):
+            return "edit"
+        return None
+
+    def signed_in(self):
+        return self.role() is not None
 
     def cookie_text(self, value, max_age):
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
@@ -1085,9 +1125,13 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.send_json(500, {"error": "server"})
 
-    def need_api(self):
-        if not self.signed_in():
+    def need_api(self, write=False):
+        role = self.role()
+        if role is None:
             self.send_json(401, {"error": "server"})
+            return False
+        if write and role != "edit":
+            self.send_json(403, {"error": "read_only"})
             return False
         if meters is None:
             self.send_json(500, {"error": "server"})
@@ -1103,10 +1147,22 @@ class Handler(BaseHTTPRequestHandler):
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         if path.startswith("/logos/"):
             self.serve_logo(path)
+        elif path.startswith("/view/"):
+            if login_locked():
+                self.send_bytes(429, b"Too many attempts", "text/plain")
+            elif view_key_ok(path[len("/view/"):]):
+                self.redirect(self.cookie_text(make_view_token(), VIEW_SECONDS))
+            else:
+                note_failed_login()
+                time.sleep(0.7)
+                self.send_bytes(404, b"Not found", "text/plain")
         elif path == "/":
-            if self.signed_in():
+            role = self.role()
+            if role:
                 page = INDEX_HTML
-                if not APP_PASSWORD:
+                if role == "view":
+                    page = page.replace('<body data-type="electricity">', '<body data-type="electricity" data-ro="1">')
+                if not APP_PASSWORD or role == "view":
                     page = page.replace('<form method="post" action="/logout"', '<form hidden method="post" action="/logout"')
                 self.send_page(page)
             else:
@@ -1137,7 +1193,7 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_login()
         elif path == "/logout":
             self.redirect(self.cookie_text("", 0))
-        elif self.need_api():
+        elif self.need_api(write=True):
             self.guarded(lambda: self.post_api(path))
 
     def handle_login(self):
@@ -1184,7 +1240,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         path = urlparse(self.path).path
-        if self.need_api():
+        if self.need_api(write=True):
             self.guarded(lambda: self.put_api(path))
 
     def put_api(self, path):
@@ -1200,7 +1256,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
-        if self.need_api():
+        if self.need_api(write=True):
             self.guarded(lambda: self.delete_api(parsed))
 
     def delete_api(self, parsed):
